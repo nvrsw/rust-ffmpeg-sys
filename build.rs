@@ -240,7 +240,10 @@ fn find_sysroot() -> Option<String> {
         return Some(sysroot.to_string());
     }
 
-    if matches!(env::var("CARGO_CFG_TARGET_OS").as_deref(), Ok("ios") | Ok("tvos")) {
+    if matches!(
+        env::var("CARGO_CFG_TARGET_OS").as_deref(),
+        Ok("ios") | Ok("tvos")
+    ) {
         let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap();
         let sdk = apple_sdk_name(&target_os, is_apple_simulator()).unwrap();
         let xcode_output = Command::new("xcrun")
@@ -264,7 +267,16 @@ fn find_sysroot() -> Option<String> {
     }
 
     if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("android") {
-        let sysroot_path = env::var("CARGO_NDK_SYSROOT_PATH").expect("Missing android sysroot path. For android cross compilation please use cargo-ndk which exposes all the required NDK paths throught env variables.");
+        let target_underscore = env::var("TARGET").unwrap().replace("-", "_");
+        let sysroot_path_from_bindgen_env =
+            env::var(format!("BINDGEN_EXTRA_CLANG_ARGS_{target_underscore}"))
+                .ok()
+                .and_then(|s| {
+                    s.split_whitespace()
+                        .find(|s| s.starts_with("--sysroot="))
+                        .map(|s| s.strip_prefix("--sysroot=").unwrap().to_string())
+                });
+        let sysroot_path = sysroot_path_from_bindgen_env.unwrap_or_else(|| env::var("CARGO_NDK_SYSROOT_PATH").expect("Missing android sysroot path. For android cross compilation please use cargo-ndk which exposes all the required NDK paths throught env variables."));
 
         if !Path::new(&sysroot_path).exists() {
             panic!("Android sysroot path does not exists: {}", sysroot_path);
@@ -383,10 +395,8 @@ fn build(sysroot: Option<&str>) -> io::Result<()> {
 
     if matches!(target_os.as_str(), "ios" | "tvos") {
         let sdk = apple_sdk_name(&target_os, is_sim).unwrap();
-        let sysroot = sysroot.expect(&format!(
-            "The sysroot is required for {} cross compilation, make sure to have available xcode or provide the $SYSROOT env var",
-            target_os
-        ));
+        let sysroot = sysroot.unwrap_or_else(|| panic!("The sysroot is required for {} cross compilation, make sure to have available xcode or provide the $SYSROOT env var",
+            target_os));
         configure.arg(format!("--sysroot={sysroot}"));
 
         let cc = Command::new("xcrun")
@@ -406,7 +416,8 @@ fn build(sysroot: Option<&str>) -> io::Result<()> {
     if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("android") {
         // cargo ndk auto populates rust env variables for android cross compilation
         // so we can just leverage the same compiler path and cflags for ffmpeg build
-        let android_cc_raw_path = env::var(format!("CC_{target}")).expect("Missing CC path for android. Make sure to use cargo-ndk for adnrdoic cross compilation");
+        let target_underscore = target.replace("-", "_");
+        let android_cc_raw_path = env::var(format!("CC_{target_underscore}")).unwrap_or_else(|_|env::var(format!("CC_{target}")).expect("Missing CC path for android. Make sure to use cargo-ndk for adnrdoic cross compilation"));
         let android_cc_path = Path::new(&android_cc_raw_path);
         if !android_cc_path.exists() {
             panic!("Android CC path does not exists: {}", android_cc_raw_path);
@@ -417,7 +428,8 @@ fn build(sysroot: Option<&str>) -> io::Result<()> {
             configure.arg(format!(
                 "--{tool}={}",
                 android_cc_path
-                    .join("..")
+                    .parent()
+                    .unwrap()
                     .join(format!("llvm-{tool}"))
                     .canonicalize()
                     .unwrap_or_else(|_| panic!("failed to resolve a path to android {}", tool))
@@ -428,6 +440,17 @@ fn build(sysroot: Option<&str>) -> io::Result<()> {
         if let Ok(android_target_flags) = env::var(format!("CFLAGS_{target}")).as_deref() {
             configure.arg(format!("--extra-cflags={android_target_flags}"));
             configure.arg(format!("--extra-ldflags={android_target_flags}"));
+        } else {
+            let target = android_cc_path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .strip_suffix("-clang")
+                .expect("CC path does not end with '-clang'")
+                .to_string();
+            let flags = format!("--target={target}");
+            configure.arg(format!("--extra-cflags={flags}"));
+            configure.arg(format!("--extra-ldflags={flags}"));
         }
 
         if matches!(
